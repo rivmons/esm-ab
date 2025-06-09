@@ -162,7 +162,7 @@ def main(args):
     )
 
     model = ESMIFRegressor(args.model).to(device)
-    criterion = nn.MSELoss()
+    criterion = nn.MarginRankingLoss(margin=1)
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
     out_dir = Path(args.out_dir)
