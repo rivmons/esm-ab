@@ -5,11 +5,17 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
+import os
+import time
 
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import autocast, GradScaler
 
 from esm import pretrained
 
@@ -17,6 +23,31 @@ from data_utils import get_dataloaders
 from util import freeze_module, spearman_corrcoef
 from esm.pretrained import esm_if1_gvp4_t16_142M_UR50
 
+# ----------------------------- Dist --------------------------------------
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 # ----------------------------- Model -------------------------------------
 class ESMIFRegressor(nn.Module):
@@ -48,7 +79,7 @@ class ESMIFRegressor(nn.Module):
 
         seqs = [("", s) for s in seqs]  # Add an empty label to each sequence.
         batch_tokens = self.alphabet.get_batch_converter()(seqs)[2].to(device)
-
+        
         confidence = torch.ones_like(~mask, dtype=coords.dtype)
         reps, _ = self.backbone(
             coords=coords,
@@ -69,30 +100,51 @@ class ESMIFRegressor(nn.Module):
         pred = self.reg_head(pooled).squeeze(-1)                # (B,)
         return pred
 
+def get_pair_indices(n):
+    return torch.combinations(torch.tensor(list(range(n))), 2, with_replacement=False)
 
 # ------------------------- Train / Eval Loop -----------------------------
 def train_epoch(model, loader, optimizer, criterion, device, val_loader=None, best_val_corr=-math.inf, save_path=None):
     model.train()
     tot_loss = tot_corr = 0.0
-    eval_every = 100
+    eval_every = len(loader) // 3
     step = 0
+    pair_ind = get_pair_indices(loader.batch_size)
+    batch_size = loader.batch_size
+    scaler = GradScaler()
 
     for batch in loader:
-        labels = batch["labels"].to(device)
-        preds  = model(batch["coords"], batch["mask"], batch["seqs"])
-        loss   = criterion(preds, labels)
- 
+        # with torch.profiler.profile(
+        #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        #     record_shapes=True,
+        #     with_stack=True,
+        # ) as prof:
+        with autocast("cuda"):
+            stime = time.time()
+            labels = batch["labels"].to(device)
+            preds  = model(batch["coords"], batch["mask"], batch["seqs"])
+
+            bs = preds.size(0)
+            if bs == batch_size: p_idx = pair_ind
+            else: p_idx = get_pair_indices(bs)
+
+            p_i, p_j = p_idx[:, 0], p_idx[:, 1]
+            targets = torch.where(labels[p_i] > labels[p_j], torch.tensor(1), torch.tensor(-1))
+            loss   = criterion(preds[p_i], preds[p_j], targets)
+
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         tot_loss += loss.item()
         step += 1
         
+        print(f'train loss: {loss.item()}, time={time.time() - stime}')
         # Perform validation every N batches and save the best model based on the highest average correlation coefficient on the validation set.
         if val_loader is not None and step % eval_every == 0:
             val_loss, val_corr, corr_dict = eval_epoch(model, val_loader, criterion, device)
-            print(f"[Step {step}] Val MSE {val_loss:.4f} ρ {val_corr:.3f}")
+            print(f"[Step {step}] Val Loss {val_loss:.4f} ρ {val_corr:.3f}")
             print(corr_dict)
             print('Current training loss:', loss.item())
 
@@ -118,7 +170,11 @@ def eval_epoch(model, loader, criterion, device):
         preds  = model(batch["coords"], batch["mask"], batch["seqs"])
 
         # Accumulate loss (weighted by the number of samples).
-        total_loss += criterion(preds, labels).item() * labels.size(0)
+        pairs = torch.combinations(preds, 2, False)
+        pairs_t = torch.combinations(labels, 2, False)
+        targets = torch.where(pairs_t[:, 0] > pairs_t[:, 1], torch.tensor(1), torch.tensor(-1))
+        loss   = criterion(pairs[:, 0], pairs[:, 1], targets)
+        total_loss += loss.item() * labels.size(0)
 
         # Collect results for grouping later.
         all_preds.append(preds.cpu())
@@ -151,18 +207,19 @@ def eval_epoch(model, loader, criterion, device):
 
     return mean_loss, mean_corr, corr_dict
 
-
 # ------------------------------ Main -------------------------------------
 def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(2)
+    print(device)
     train_loader, val_loader, test_loader = get_dataloaders(
         args.meta_json, batch_size=args.batch_size,
         num_workers=args.num_workers, seed=777
     )
 
     model = ESMIFRegressor(args.model).to(device)
-    criterion = nn.MarginRankingLoss(margin=1)
+    criterion = nn.MarginRankingLoss(margin=0.01)
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
     out_dir = Path(args.out_dir)
@@ -187,8 +244,8 @@ def main(args):
 
         print(
             f"[Epoch {epoch:03d}] "
-            f"Train MSE {tr_loss:.4f} ρ {tr_corr:.3f} | "
-            f"Val MSE {val_loss:.4f} ρ {val_corr:.3f}"
+            f"Train Loss {tr_loss:.4f} ρ {tr_corr:.3f} | "
+            f"Val Loss {val_loss:.4f} ρ {val_corr:.3f}"
         )
         
         for ag, r in sorted(val_corr_dict.items()):
@@ -201,7 +258,7 @@ def main(args):
     # ------------------------- Final Test -------------------------
     model.load_state_dict(torch.load(out_dir / "best_model.pt"))
     te_loss, te_corr = eval_epoch(model, test_loader, criterion, device)
-    print(f"\n[Test]  MSE {te_loss:.4f}  |  Pearson ρ {te_corr:.3f}")
+    print(f"\n[Test]  Loss {te_loss:.4f}  |  Pearson ρ {te_corr:.3f}")
 
 
 if __name__ == "__main__":

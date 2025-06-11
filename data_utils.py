@@ -6,7 +6,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from sklearn.model_selection import train_test_split
 
 import biotite.structure as bst
@@ -211,8 +211,8 @@ def get_dataloaders(meta_json: str, batch_size=4, num_workers=4, seed=42):
 
     dl_kw = dict(batch_size=batch_size, num_workers=num_workers, collate_fn=collate)
     return (
-        DataLoader(AffinityDS([samples[i] for i in tr], cache), shuffle=True,  **dl_kw),
-        DataLoader(AffinityDS([samples[i] for i in va], cache), shuffle=False, **dl_kw),
-        DataLoader(AffinityDS([samples[i] for i in te], cache), shuffle=False, **dl_kw),
+        DataLoader(AffinityDS([samples[i] for i in tr], cache), shuffle=True,  **dl_kw, pin_memory=True),
+        DataLoader(AffinityDS([samples[i] for i in va], cache), shuffle=False, **dl_kw, pin_memory=True),
+        DataLoader(AffinityDS([samples[i] for i in te], cache), shuffle=False, **dl_kw, pin_memory=True),
     )
 # --------------------------------------------------------------------------
