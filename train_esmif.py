@@ -26,6 +26,7 @@ from esm import pretrained
 from data_utils import get_dataloaders
 from util import freeze_module, spearman_corrcoef
 from esm.pretrained import esm_if1_gvp4_t16_142M_UR50
+from loss import pairwiseRankingLoss, pairwiseRankingLoss_random, get_pair_indices
 
 # ----------------------------- Dist --------------------------------------
 
@@ -104,18 +105,16 @@ class ESMIFRegressor(nn.Module):
         pred = self.reg_head(pooled).squeeze(-1)                # (B,)
         return pred
 
-def get_pair_indices(n):
-    return torch.combinations(torch.tensor(list(range(n))), 2, with_replacement=False)
-
 # ------------------------- Train / Eval Loop -----------------------------
 def train_epoch(model, loader, optimizer, criterion, device, val_loader=None, best_val_corr=-math.inf, save_path=None, scheduler=None):
     model.train()
     tot_loss = tot_corr = 0.0
     eval_every = len(loader) // 3
     step = 0
-    pair_ind = get_pair_indices(loader.batch_size)
     batch_size = loader.batch_size
     scaler = GradScaler()
+
+    pair_ind = get_pair_indices(loader.batch_size)
 
     for batch in loader:
         # with torch.profiler.profile(
@@ -127,14 +126,8 @@ def train_epoch(model, loader, optimizer, criterion, device, val_loader=None, be
             stime = time.time()
             labels = batch["labels"].to(device)
             preds  = model(batch["coords"], batch["mask"], batch["seqs"])
-
-            bs = preds.size(0)
-            if bs == batch_size: p_idx = pair_ind
-            else: p_idx = get_pair_indices(bs)
-
-            p_i, p_j = p_idx[:, 0], p_idx[:, 1]
-            targets = torch.where(labels[p_i] > labels[p_j], torch.tensor(1), torch.tensor(-1))
-            loss   = criterion(preds[p_i], preds[p_j], targets)
+            # loss   = criterion(*pairwiseRankingLoss_random(preds, labels, pair_ind if preds.size(0) == batch_size else None))
+            loss   = criterion(*pairwiseRankingLoss(batch["antigen"], preds, labels))
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -234,7 +227,7 @@ class PEFTWrapper(nn.Module):
 def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(3)
+    torch.cuda.set_device(6)
     print(device)
 
     train_loader, val_loader, test_loader = get_dataloaders(
@@ -262,7 +255,7 @@ def main(args):
     scheduler = get_scheduler(
         name="cosine",  
         optimizer=optimizer,
-        num_warmup_steps=int(0.05 * train_steps),
+        num_warmup_steps=int(0.01 * train_steps),
         num_training_steps=train_steps
     )
 
