@@ -24,7 +24,7 @@ from transformers.optimization import get_scheduler
 from esm import pretrained
 
 from data_utils import get_dataloaders
-from util import freeze_module, spearman_corrcoef
+from util import freeze_module, spearman_corrcoef, gpu_lowestvram
 from esm.pretrained import esm_if1_gvp4_t16_142M_UR50
 from loss import pairwiseRankingLoss, pairwiseRankingLoss_random, get_pair_indices
 
@@ -62,13 +62,14 @@ class ESMIFRegressor(nn.Module):
     - Input: coords (B, L, 3, 3), mask (B, L), seqs (list[str])
     """
 
-    def __init__(self, model_name: str = "esm_if1_gvp4_t16_142M"):
+    def __init__(self, model_name: str = "esm_if1_gvp4_t16_142M", freeze=True):
         super().__init__()
         # self.backbone, alphabet = pretrained.load_model_and_alphabet(model_name)
         self.backbone, self.alphabet = esm_if1_gvp4_t16_142M_UR50()
 
         # print(self.backbone)
-        # freeze_module(self.backbone)
+        if freeze:
+            freeze_module(self.backbone)
 
         hidden_dim = self.backbone.decoder.embed_dim
         self.reg_head = nn.Sequential(
@@ -227,15 +228,16 @@ class PEFTWrapper(nn.Module):
 def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(6)
+    torch.cuda.set_device(gpu_lowestvram())
     print(device)
 
     train_loader, val_loader, test_loader = get_dataloaders(
         args.meta_json, batch_size=args.batch_size,
         num_workers=args.num_workers, seed=777
     )
-
-    model = ESMIFRegressor(args.model).to(device)
+    
+    # lora -> freeze=false
+    model = ESMIFRegressor(args.model, freeze=False).to(device)
     lora_config = LoraConfig(
         r=8,
         lora_alpha=32,
@@ -262,6 +264,10 @@ def main(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(out_dir / "runs"))
+
+    torch.save(train_loader, Path(args.out_dir, "trainloader.pth"))
+    torch.save(val_loader, Path(args.out_dir, "valloader.pth"))
+    torch.save(test_loader, Path(args.out_dir, "testloader.pth"))
 
     best_val_corr = -math.inf
     for epoch in range(1, args.epochs + 1):
