@@ -146,7 +146,7 @@ def train_epoch(model, loader, optimizer, criterion, device, val_loader=None, be
         tot_loss += loss.item()
         step += 1
         
-        print(f'train loss: {loss.item():.4f}, time={(time.time() - stime):.3f}, lr={optimizer.param_groups[0]["lr"]:.4f}')
+        print(f'train loss: {loss.item()}, time={(time.time() - stime):.3f}, lr={optimizer.param_groups[0]["lr"]:.8f}')
         # Perform validation every N batches and save the best model based on the highest average correlation coefficient on the validation set.
         if val_loader is not None and step % eval_every == 0:
             val_loss, val_corr, corr_dict = eval_epoch(model, val_loader, criterion, device)
